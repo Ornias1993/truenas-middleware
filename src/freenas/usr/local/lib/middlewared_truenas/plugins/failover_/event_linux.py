@@ -1,5 +1,4 @@
 from collections import defaultdict
-from threading import Lock
 import os
 import time
 import contextlib
@@ -8,14 +7,15 @@ import signal
 import logging
 
 from middlewared.utils import filter_list
-from middlewared.service import Service, private
+from middlewared.service import Service, job
 
 logger = logging.getLogger('failover')
 
 
-# This is the primitive lock used to protect a failover "event".
-# This means that we will grab an exclusive lock before
-# we call any of the code that does any of the work.
+# When we get to the point of transitioning to MASTER or BACKUP
+# we wrap the associated methods (`vrrp_master` and `vrrp_backup`)
+# in a job (lock) so that we can protect the failover event.
+#
 # This does a few things:
 #
 #    1. protects us if we have an interface that has a
@@ -30,7 +30,6 @@ logger = logging.getLogger('failover')
 # If any of the above scenarios occur, we want to ensure
 # that only one thread is trying to run fenced or import the
 # zpools.
-EVENT_LOCK = Lock()
 
 
 class ZpoolExportTimeout(Exception):
@@ -52,6 +51,10 @@ class IgnoreFailoverEvent(Exception):
 
 
 class FailoverService(Service):
+
+    class Config:
+        private = True
+        namespace = 'failover.event'
 
     def __init__(self):
 
@@ -87,14 +90,12 @@ class FailoverService(Service):
         # zpool(s) when becoming the BACKUP node
         self.zpool_export_timeout = 4  # seconds
 
-    @private
     def run_call(self, method, *args, **kwargs):
         try:
             return self.middleware.call_sync(method, *args, **kwargs)
         except Exception as e:
             logger.error('Failed to run %s:%r:%r %s', method, args, kwargs, e)
 
-    @private
     def event(self, ifname, event):
 
         refresh = True
@@ -112,7 +113,6 @@ class FailoverService(Service):
 
         raise ZpoolExportTimeout()
 
-    @private
     def generate_failover_data(self):
 
         # only care about name, guid, and status
@@ -154,14 +154,57 @@ class FailoverService(Service):
 
         return data
 
-    @private
-    def _event(self, ifname, event):
+    def validate(self, ifname, event):
 
-        # first thing to check is if there is an ongoing event
-        # if there is, ignore it
-        if EVENT_LOCK.locked():
-            logger.warning('Failover event is already being processed, ignoring.')
-            raise IgnoreFailoverEvent()
+        """
+        When a failover event is generated we need to account for a few
+        scenarios.
+
+            TODO: item #1 will be a new feature so need to come back to
+            it after initial implementation is done
+
+            1. if we have received a rapid succession of events for
+                for an interface, then we check the time delta from the
+                previous event. If it's the same interface bouncing back
+                and forth then we ignore the event and raise an alert.
+
+            2. if we receive an event for an interface but there is a
+                current event that is being processed for that interface
+                then we ignore the incoming event.
+        """
+
+        # first check if there is an ongoing failover event
+        current_events = self.run_call(
+            'core.get_jobs', [
+                ('OR', [
+                    ('method', '=', 'failover.event.vrrp_master')
+                    ('method', '=', 'failover.event.vrrp_backup')
+                ])
+            ]
+        )
+
+        # only care about RUNNING events
+        current_events = [i for i in current_events if i['state'] == 'RUNNING']
+        for i in current_events:
+            if i['method'] == 'failover.event.vrrp_master':
+                # if the incoming event is also a MASTER event then log it and ignore
+                if event in ('MASTER', 'forcetakeover'):
+                    logger.warning(
+                        'A failover MASTER event is already being processed, ignoring.'
+                    )
+                    raise IgnoreFailoverEvent()
+
+            if i['method'] == 'failover.event.vrrp_backup':
+                # if the incoming event is also a BACKUP event then log it and ignore
+                if event == 'BACKUP':
+                    logger.warning(
+                        'A failover BACKUP event is already being processed, ignoring.'
+                    )
+                    raise IgnoreFailoverEvent()
+
+            # TODO: timdelta flapping event
+
+    def _event(self, ifname, event):
 
         forcetakeover = False
         if event == 'forcetakeover':
@@ -170,71 +213,89 @@ class FailoverService(Service):
         # generate data to be used during the failover event
         fobj = self.generate_failover_data()
 
-        # grab the primitive lock
-        with EVENT_LOCK:
-            if not forcetakeover:
-                if fobj['disabled'] and not fobj['master']:
-                    # if forcetakeover is false, and failover is disabled
-                    # and we're not set as the master controller, then
-                    # there is nothing we need to do.
-                    logger.warning('Failover is disabled, assuming backup.')
-                    self.run_call('service.restart', 'keepalived')
+        if not forcetakeover:
+            if fobj['disabled'] and not fobj['master']:
+                # if forcetakeover is false, and failover is disabled
+                # and we're not set as the master controller, then
+                # there is nothing we need to do.
+                logger.warning('Failover is disabled, assuming backup.')
+                raise IgnoreFailoverEvent()
+
+            # If there is a state change on a non-critical interface then
+            # ignore the event and return
+            ignore = [i for i in fobj['non_crit_interfaces'] if i in ifname]
+            if ignore:
+                logger.warning(
+                    'Ignoring state change on non-critical interface "%s".', ifname
+                )
+                raise IgnoreFailoverEvent()
+
+            # if the other controller is already master, then assume backup
+            try:
+                if self.call_sync('failover.call_remote', 'failover.status') == 'MASTER':
+                    logger.warning('Other node is already MASTER, assuming BACKUP.')
                     raise IgnoreFailoverEvent()
+            except Exception:
+                logger.error('Failed to contact the other node', exc_info=True)
 
-                # any logic below here means failover is disabled and we are
-                # designated as the master controller so act accordingly
+            # ensure the zpools are imported
+            needs_imported = False
+            for vol in fobj['volumes']:
+                zpool = self.run_call('pool.query', [('name', '=', vol['name'])], {'get': True})
+                if zpool['status'] != 'ONLINE':
+                    needs_imported = True
+                    # try to restart the vrrp service on standby controller to ensure all interfaces
+                    # on this controller are in the MASTER state
+                    try:
+                        self.run_call('failover.call_remote', 'service.restart', ['keepalived'])
+                    except Exception:
+                        logger.error('Failed contacting BACKUP controller when restarting vrrp.', exc_info=True)
+                    break
 
-                # If there is a state change on a non-critical interface then
-                # ignore the event and return
-                ignore = [i for i in fobj['non_crit_interfaces'] if i in ifname]
-                if ignore:
-                    logger.warning(f'Ignoring state change on non-critical interface:{ifname}.')
-                    raise IgnoreFailoverEvent()
+            # means all zpools are already imported so nothing else to do
+            if not needs_imported:
+                logger.warning('Failover disabled but zpool(s) are already imported. Assuming MASTER.')
+                return
+            # means at least 1 of the zpools are not imported so act accordingly
+            else:
+                # set the event to MASTER
+                event = 'MASTER'
+                # set force_fenced to True so that it's called with the --force option which
+                # guarantees the disks will be reserved by this controller
+                force_fenced = needs_imported
 
-                # if the other controller is already master, then assume backup
-                try:
-                    if self.call_sync('failover.call_remote', 'failover.status') == 'MASTER':
-                        logger.warning('Other node is already active, assuming backup.')
-                        self.run_call('service.restart', 'keepalived')
-                        raise IgnoreFailoverEvent()
-                except Exception:
-                    logger.error('Failed to contact the other node', exc_info=True)
+        # if we get here then the last verification step that
+        # we need to do is ensure there aren't any current ongoing failover events
+        self.run_call('failover.event.validate', ifname, event)
 
-                # ensure the zpools are imported
-                needs_imported = False
-                for vol in fobj['volumes']:
-                    zpool = self.run_call('pool.query', [('name', '=', vol['name'])], {'get': True})
-                    if zpool['status'] != 'ONLINE':
-                        needs_imported = True
-                        # try to restart the vrrp service on standby controller to ensure all interfaces
-                        # on this controller are in the MASTER state
-                        try:
-                            self.run_call('failover.call_remote', 'service.restart', ['keepalived'])
-                        except Exception:
-                            logger.error('Failed contacting standby controller when restarting vrrp.', exc_info=True)
-                        break
+        # start the MASTER failover event
+        if event in ('MASTER', 'forcetakeover'):
+            vrrp_master_job = self.run_call(
+                'failover.event.vrrp_master', fobj, ifname, event, force_fenced, forcetakeover
+            ).wait_sync()
 
-                # means all zpools are already imported so nothing else to do
-                if not needs_imported:
-                    logger.warning('Failover disabled but zpool(s) are imported. Assuming active.')
-                    return
-                # means at least 1 of the zpools are not imported so act accordingly
-                else:
-                    # set the event to MASTER
-                    event = 'MASTER'
-                    # set force_fenced to True so that it's
-                    # called with the --force option which
-                    # guarantees the disks will be reserved
-                    # by this controller
-                    force_fenced = needs_imported
+            if vrrp_master_job.error:
+                logger.error(
+                    'An error occurred while becoming the MASTER node.'
+                    f' {vrrp_master_job.error}'
+                )
+                return self.failover_successful
 
-            if event == 'MASTER' or event == 'forcetakeover':
-                return self.vrrp_master(fobj, ifname, event, force_fenced, forcetakeover)
-            elif event == 'BACKUP':
-                return self.vrrp_backup(fobj, ifname, event, force_fenced)
+        # start the BACKUP failover event
+        elif event == 'BACKUP':
+            vrrp_backup_job = self.run_call(
+                'failover.event.vrrp_backup', fobj, ifname, event, force_fenced
+            ).wait_sync()
 
-    @private
-    def vrrp_master(self, fobj, ifname, vhid, event, force_fenced, forcetakeover):
+            if vrrp_backup_job.error:
+                logger.error(
+                    'An error occurred while becoming the BACKUP node.'
+                    f' {vrrp_backup_job.error}'
+                )
+                return self.failover_successful
+
+    @job(lock='vrrp_master')
+    def vrrp_master(self, job, fobj, ifname, vhid, event, force_fenced, forcetakeover):
 
         fenced_error = None
         if forcetakeover or force_fenced:
@@ -268,13 +329,14 @@ class FailoverService(Service):
             # other node has them as MASTER so ignore the event.
             if len(status[1]):
                 logger.warning(
-                    f'Received MASTER event for {ifname}, but other '
-                    'interfaces "{status[0]}" are still working on the '
-                    'MASTER node. Ignoring event.'
+                    'Received MASTER event for "%s", but other '
+                    'interfaces "%r" are still working on the '
+                    'MASTER node. Ignoring event.', ifname, status[0],
                 )
-                raise IgnoreFailoverEvent
 
-            logger.warning(f'Entering MASTER on {ifname}.')
+                raise IgnoreFailoverEvent()
+
+            logger.warning('Entering MASTER on "%s".', ifname)
 
             # need to stop fenced just in case it's running already
             self.run_call('failover.fenced.stop')
@@ -294,7 +356,7 @@ class FailoverService(Service):
             elif fenced_error == 5:
                 logger.error('Fenced encountered an unexpected fatal error, exiting!')
             else:
-                logger.error(f'Fenced exited with code:{fenced_error} which should never happen, exiting!')
+                logger.error(f'Fenced exited with code "{fenced_error}" which should never happen, exiting!')
 
             return self.failover_successful
 
@@ -323,7 +385,7 @@ class FailoverService(Service):
 
         failed = []
         for vol in fobj['volumes']:
-            logger.info(f'Importing {vol["name"]}')
+            logger.info('Importing %s', vol['name'])
 
             # import the zpool(s)
             try:
@@ -353,8 +415,8 @@ class FailoverService(Service):
         if len(failed) == len(fobj['volumes']):
             for i in failed:
                 logger.error(
-                    f'Failed to import volume with name:{failed["name"]} with guid:{failed["guid"]} '
-                    'with error:{failed["error"]}'
+                    'Failed to import volume with name "%s" with guid "%s" '
+                    'with error "%s"', failed['name'], failed['guid'], failed['error'],
                 )
 
             logger.error('All volumes failed to import!')
@@ -363,9 +425,11 @@ class FailoverService(Service):
         # if we fail to import any of the zpools then alert the user but continue the process
         for i in failed:
             logger.error(
-                f'Failed to import volume with name:{failed["name"]} with guid:{failed["guid"]} '
-                'with error:{failed["error"]}. '
-                'However, other zpools imported so we continued the failover process.'
+                'Failed to import volume with name "%s" with guid "%s" '
+                'with error "%s"', failed['name'], failed['guid'], failed['error'],
+            )
+            logger.error(
+                'However, other zpools imported so the failover process continued.'
             )
 
         logger.info('Volume imports complete.')
@@ -391,7 +455,7 @@ class FailoverService(Service):
         for i in self.critical_services:
             for j in fobj['services']:
                 if i == j['srv_service'] and j['srv_enable']:
-                    logger.info(f'Restarting critical service:{i}')
+                    logger.info('Restarting critical service "%s"', i)
                     self.run_call('service.restart', i, self.ha_propagate)
 
         # TODO: look at nftables
@@ -422,7 +486,7 @@ class FailoverService(Service):
 
         for i in fobj['services']:
             if i['srv_service'] not in self.critical_services and i['srv_enable']:
-                logger.info('Restarting service:{i["srv_service"]}')
+                logger.info('Restarting service "%s"', i['service'])
                 self.run_call('service.restart', i['srv_service'], self.ha_propagate)
 
         # TODO: jails don't exist on SCALE (yet)
@@ -449,8 +513,8 @@ class FailoverService(Service):
 
         return self.failover_successful
 
-    @private
-    def vrrp_backup(self, fobj, ifname, event, force_fenced):
+    @job(lock='vrrp_backup')
+    def vrrp_backup(self, job, fobj, ifname, event, force_fenced):
 
         # we need to check a couple things before we stop fenced
         # and start the process of becoming backup
@@ -472,13 +536,14 @@ class FailoverService(Service):
         # interfaces that were still in the MASTER state so ignore the event.
         if len(status[0]):
             logger.warning(
-                f'Received BACKUP event for {ifname}, but other '
-                'interfaces "{status[1]}" are still working. '
-                'Ignoring event.'
+                'Received BACKUP event for "%s", but other '
+                'interfaces "%r" are still working. '
+                'Ignoring event.', ifname, status[1],
             )
-            raise IgnoreFailoverEvent
 
-        logger.warning(f'Entering BACKUP on {ifname}')
+            raise IgnoreFailoverEvent()
+
+        logger.warning('Entering BACKUP on "%s".', ifname)
 
         # we need to stop fenced first
         logger.warning('Stopping fenced')
@@ -521,7 +586,7 @@ class FailoverService(Service):
             try:
                 for vol in fobj['volumes']:
                     self.run_call('zfs.pool.export', vol['name'], {'force': True})
-                    logger.info(f'Exported {vol["name"]}')
+                    logger.info('Exported "%s"', vol['name'])
             except Exception:
                 # catch any exception that could be raised
                 # We sleep for 5 seconds to cause the signal timeout to occur.
@@ -577,8 +642,8 @@ class FailoverService(Service):
 async def vrrp_fifo_hook(middleware, data):
 
     # `data` is a single line separated by whitespace for a total of 4 words.
-    # we ignore the 1st word (vrrp instance) and 4th word (priority)
-    # since both of them are static
+    # we ignore the 1st word (vrrp instance or group) and the 4th word (priority)
+    # since both of them are static in our use case
     data = data.split()
 
     iface = data[1].strip('"')  # interface
