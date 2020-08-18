@@ -27,17 +27,21 @@ class DetectFailoverStatusService(Service):
             if any(filter(lambda x: x.get('status') != 'OFFLINE', pools)):
                 return 'MASTER'
 
-            # check if there is an ongoing failover event
+            # need to check to check 2 things if we get to this point
+            #
+            #   1. check to make sure there isn't an ongoing failover event
+            #
+            #   2. check to make sure that the last failover event didn't
+            #       fail
+            #
             failover_events = await self.middleware.call(
-                'core.get_jobs', [
-                    ('OR', [
-                        ('method', '=', 'failover.event.vrrp_master'),
-                        ('method', '=', 'failover.event.vrrp_backup'),
-                    ])
-                ]
+                'core.get_jobs',
+                [('method', '=', 'failover.event.vrrp_master')],
+                {'order_by': ['-id']},
             )
 
-            # only care about RUNNING events
             for i in failover_events:
                 if i['state'] == 'RUNNING':
                     return i['progress']['description']
+                elif i['result'] == 'ERROR':
+                    return i['result']

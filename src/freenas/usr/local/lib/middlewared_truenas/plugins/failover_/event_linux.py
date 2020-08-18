@@ -56,39 +56,37 @@ class FailoverService(Service):
         private = True
         namespace = 'failover.event'
 
-    def __init__(self):
+    # boolean that represents if a failover event was successful or not
+    failover_successful = False
 
-        # boolean that represents if a failover event was successful or not
-        self.failover_successful = False
+    # list of critical services that get restarted first
+    # before the other services during a failover event
+    critical_services = ['iscsitarget', 'cifs', 'nfs', 'afp']
 
-        # list of critical services that get restarted first
-        # before the other services during a failover event
-        self.critical_services = ['iscsitarget', 'cifs', 'nfs', 'afp']
+    # option to be given when changing the state of a service
+    # during a failover event, we do not want to replicate
+    # the state of a service to the other controller since
+    # that's being handled by us explicitly
+    ha_propagate = {'ha_propagate': False}
 
-        # option to be given when changing the state of a service
-        # during a failover event, we do not want to replicate
-        # the state of a service to the other controller since
-        # that's being handled by us explicitly
-        self.ha_propagate = {'ha_propagate': False}
+    # file created by the pool plugin during certain
+    # scenarios when importing zpools on boot
+    zpool_killcache = '/data/zfs/killcache'
 
-        # file created by the pool plugin during certain
-        # scenarios when importing zpools on boot
-        self.zpool_killcache = '/data/zfs/killcache'
+    # zpool cache file managed by ZFS
+    zpool_cache_file = '/data/zfs/zpool.cache'
 
-        # zpool cache file managed by ZFS
-        self.zpool_cache_file = '/data/zfs/zpool.cache'
+    # zpool cache file that's been saved by pool plugin
+    # during certain scenarios importing zpools on boot
+    zpool_cache_file_saved = f'{zpool_cache_file}.saved'
 
-        # zpool cache file that's been saved by pool plugin
-        # during certain scenarios importing zpools on boot
-        self.zpool_cache_file_saved = f'{self.zpool_cache_file}.saved'
+    # This file is managed in unscheduled_reboot_alert.py
+    # Ticket 39114
+    watchdog_alert_file = "/data/sentinels/.watchdog-alert"
 
-        # This file is managed in unscheduled_reboot_alert.py
-        # Ticket 39114
-        self.watchdog_alert_file = "/data/sentinels/.watchdog-alert"
-
-        # this is the time limit we place on exporting the
-        # zpool(s) when becoming the BACKUP node
-        self.zpool_export_timeout = 4  # seconds
+    # this is the time limit we place on exporting the
+    # zpool(s) when becoming the BACKUP node
+    zpool_export_timeout = 4  # seconds
 
     def run_call(self, method, *args, **kwargs):
         try:
@@ -297,6 +295,14 @@ class FailoverService(Service):
     @job(lock='vrrp_master')
     def vrrp_master(self, job, fobj, ifname, vhid, event, force_fenced, forcetakeover):
 
+        # vrrp does the "election" for us. If we've gotten this far
+        # then the specified timeout for NOT receiving an advertisement
+        # has elapsed. Setting the progress to ELECTING is to prevent
+        # extensive API breakage with the platform indepedent failover plugin
+        # as well as the front-end (webUI) even though the term is misleading
+        # in this use case
+        job.set_progress(None, description='ELECTING')
+
         fenced_error = None
         if forcetakeover or force_fenced:
             # reserve the disks forcefully ignoring if the other node has the disks
@@ -334,6 +340,10 @@ class FailoverService(Service):
                     'MASTER node. Ignoring event.', ifname, status[0],
                 )
 
+                # raising an exception in a job will cause the state to be set to
+                # FAILED. Technically the failover event has failed at this point
+                # but it's by design so set the result of the job to 'IGNORED'
+                job.set_result('IGNORED')
                 raise IgnoreFailoverEvent()
 
             logger.warning('Entering MASTER on "%s".', ifname)
@@ -383,6 +393,9 @@ class FailoverService(Service):
                 with contextlib.suppress(Exception):
                     shutil.copy2(self.zpool_cache_file, self.zpool_cache_file_saved)
 
+        # set the progress to IMPORTING
+        job.set_progress(None, description='IMPORTING')
+
         failed = []
         for vol in fobj['volumes']:
             logger.info('Importing %s', vol['name'])
@@ -420,17 +433,20 @@ class FailoverService(Service):
                 )
 
             logger.error('All volumes failed to import!')
+            job.set_result('ERROR')
             return self.failover_successful
 
         # if we fail to import any of the zpools then alert the user but continue the process
-        for i in failed:
-            logger.error(
-                'Failed to import volume with name "%s" with guid "%s" '
-                'with error "%s"', failed['name'], failed['guid'], failed['error'],
-            )
-            logger.error(
-                'However, other zpools imported so the failover process continued.'
-            )
+        elif len(failed):
+            job.set_result('ERROR')
+            for i in failed:
+                logger.error(
+                    'Failed to import volume with name "%s" with guid "%s" '
+                    'with error "%s"', failed['name'], failed['guid'], failed['error'],
+                )
+                logger.error(
+                    'However, other zpools imported so the failover process continued.'
+                )
 
         logger.info('Volume imports complete.')
 
@@ -509,6 +525,7 @@ class FailoverService(Service):
             self.run_call('kmip.initialize_keys')
 
         logger.info('Failover event complete.')
+
         self.failover_successful = True
 
         return self.failover_successful
@@ -541,6 +558,7 @@ class FailoverService(Service):
                 'Ignoring event.', ifname, status[1],
             )
 
+            job.set_result('IGNORED')
             raise IgnoreFailoverEvent()
 
         logger.warning('Entering BACKUP on "%s".', ifname)

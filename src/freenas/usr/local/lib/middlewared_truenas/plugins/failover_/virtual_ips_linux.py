@@ -71,11 +71,11 @@ class DetectVirtualIpStates(Service):
         for iface in interfaces:
             if iface['name'] in int_ifaces:
                 continue
-            if iface['name'] not in crit_ifaces:
+            elif iface['name'] not in crit_ifaces:
                 continue
-            if iface['state']['vrrp_config'][0]['state'] == 'MASTER':
+            elif iface['state']['vrrp_config'][0]['state'] == 'MASTER':
                 masters.append(iface['name'])
-            if iface['state']['vrrp_config'][0]['state'] == 'BACKUP':
+            elif iface['state']['vrrp_config'][0]['state'] == 'BACKUP':
                 backups.append(iface['name'])
             else:
                 self.logger.warning(
