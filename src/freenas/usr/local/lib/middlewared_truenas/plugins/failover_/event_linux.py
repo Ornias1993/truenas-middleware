@@ -54,7 +54,7 @@ class FailoverService(Service):
 
     class Config:
         private = True
-        namespace = 'failover.event'
+        namespace = 'failover.events'
 
     # boolean that represents if a failover event was successful or not
     failover_successful = False
@@ -175,8 +175,8 @@ class FailoverService(Service):
         current_events = self.run_call(
             'core.get_jobs', [
                 ('OR', [
-                    ('method', '=', 'failover.event.vrrp_master')
-                    ('method', '=', 'failover.event.vrrp_backup')
+                    ('method', '=', 'failover.events.vrrp_master')
+                    ('method', '=', 'failover.events.vrrp_backup')
                 ])
             ]
         )
@@ -184,7 +184,7 @@ class FailoverService(Service):
         # only care about RUNNING events
         current_events = [i for i in current_events if i['state'] == 'RUNNING']
         for i in current_events:
-            if i['method'] == 'failover.event.vrrp_master':
+            if i['method'] == 'failover.events.vrrp_master':
                 # if the incoming event is also a MASTER event then log it and ignore
                 if event in ('MASTER', 'forcetakeover'):
                     logger.warning(
@@ -192,7 +192,7 @@ class FailoverService(Service):
                     )
                     raise IgnoreFailoverEvent()
 
-            if i['method'] == 'failover.event.vrrp_backup':
+            if i['method'] == 'failover.events.vrrp_backup':
                 # if the incoming event is also a BACKUP event then log it and ignore
                 if event == 'BACKUP':
                     logger.warning(
@@ -216,7 +216,9 @@ class FailoverService(Service):
                 # if forcetakeover is false, and failover is disabled
                 # and we're not set as the master controller, then
                 # there is nothing we need to do.
-                logger.warning('Failover is disabled, assuming backup.')
+                logger.warning(
+                    'Failover is disabled but this node is marked as the BACKUP node. Assuming BACKUP.'
+                )
                 raise IgnoreFailoverEvent()
 
             # If there is a state change on a non-critical interface then
@@ -228,13 +230,15 @@ class FailoverService(Service):
                 )
                 raise IgnoreFailoverEvent()
 
+            # this section needs to run as quick as possible so we check if the remote
+            # client is even connected before we try and start doing remote_calls
+            remote_connected = self.run_call('failover.remote_connected')
+
             # if the other controller is already master, then assume backup
-            try:
-                if self.call_sync('failover.call_remote', 'failover.status') == 'MASTER':
+            if remote_connected:
+                if self.run_call('failover.call_remote', 'failover.status') == 'MASTER':
                     logger.warning('Other node is already MASTER, assuming BACKUP.')
                     raise IgnoreFailoverEvent()
-            except Exception:
-                logger.error('Failed to contact the other node', exc_info=True)
 
             # ensure the zpools are imported
             needs_imported = False
@@ -242,12 +246,6 @@ class FailoverService(Service):
                 zpool = self.run_call('pool.query', [('name', '=', vol['name'])], {'get': True})
                 if zpool['status'] != 'ONLINE':
                     needs_imported = True
-                    # try to restart the vrrp service on standby controller to ensure all interfaces
-                    # on this controller are in the MASTER state
-                    try:
-                        self.run_call('failover.call_remote', 'service.restart', ['keepalived'])
-                    except Exception:
-                        logger.error('Failed contacting BACKUP controller when restarting vrrp.', exc_info=True)
                     break
 
             # means all zpools are already imported so nothing else to do
@@ -264,12 +262,12 @@ class FailoverService(Service):
 
         # if we get here then the last verification step that
         # we need to do is ensure there aren't any current ongoing failover events
-        self.run_call('failover.event.validate', ifname, event)
+        self.run_call('failover.events.validate', ifname, event)
 
         # start the MASTER failover event
         if event in ('MASTER', 'forcetakeover'):
             vrrp_master_job = self.run_call(
-                'failover.event.vrrp_master', fobj, ifname, event, force_fenced, forcetakeover
+                'failover.events.vrrp_master', fobj, ifname, event, force_fenced, forcetakeover
             ).wait_sync()
 
             if vrrp_master_job.error:
@@ -282,7 +280,7 @@ class FailoverService(Service):
         # start the BACKUP failover event
         elif event == 'BACKUP':
             vrrp_backup_job = self.run_call(
-                'failover.event.vrrp_backup', fobj, ifname, event, force_fenced
+                'failover.events.vrrp_backup', fobj, ifname, event, force_fenced
             ).wait_sync()
 
             if vrrp_backup_job.error:
@@ -293,7 +291,7 @@ class FailoverService(Service):
                 return self.failover_successful
 
     @job(lock='vrrp_master')
-    def vrrp_master(self, job, fobj, ifname, vhid, event, force_fenced, forcetakeover):
+    def vrrp_master(self, job, fobj, ifname, event, force_fenced, forcetakeover):
 
         # vrrp does the "election" for us. If we've gotten this far
         # then the specified timeout for NOT receiving an advertisement
@@ -664,23 +662,23 @@ async def vrrp_fifo_hook(middleware, data):
     # since both of them are static in our use case
     data = data.split()
 
-    iface = data[1].strip('"')  # interface
-    state = data[2]  # the state that is being transititoned to
+    ifname = data[1].strip('"')  # interface
+    event = data[2]  # the state that is being transititoned to
 
     # we only care about MASTER or BACKUP events currently
-    if state not in ('MASTER', 'BACKUP'):
+    if event not in ('MASTER', 'BACKUP'):
         return
 
     middleware.send_event(
         'failover.vrrp_event',
         'CHANGED',
         fields={
-            'iface': iface,
-            'state': state,
+            'ifname': ifname,
+            'event': event,
         }
     )
 
-    await middleware.call('failover.event', iface, state)
+    await middleware.call('failover.events.event', ifname, event)
 
 
 def setup(middleware):
