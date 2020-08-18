@@ -1,4 +1,4 @@
-from middlewared.service import private, Service
+from middlewared.service import Service
 from middlewared.utils import filter_list
 from middlewared.plugins.interface.netif import netif
 
@@ -6,9 +6,9 @@ from middlewared.plugins.interface.netif import netif
 class DetectVirtualIpStates(Service):
 
     class Config:
+        private = True
         namespace = 'failover.vip'
 
-    @private
     async def check_failover_group(self, ifname, groups):
 
         """
@@ -18,22 +18,25 @@ class DetectVirtualIpStates(Service):
         masters, backups = [], []
 
         # get failover group id for `iface`
-        group_id = [group for group, names in groups.items() if ifname in names][0]
+        group_id = [
+            group for group, names in groups.items() if ifname in names
+        ][0]
 
         # get all interfaces in `group_id`
-        ids = [names for group, names in groups.items() if group == group_id][0]
+        ids = [
+            names for group, names in groups.items() if group == group_id
+        ][0]
 
         # need to remove the passed in `ifname` from the list
         ids.remove(ifname)
 
         # if the user provided VIP(s) is/are missing from the interface
-        # then it's considered "BACKUP" else "MASTER" so return
-        # True for healthy (MASTER) or False for not healthy (BACKUP)
-        # maybe?? Not sure, need to work on networking API first
+        # then it's considered "BACKUP" if the interface has the VIP(s)
+        # then it's considered "MASTER"
         if len(ids):
 
-            # we have more than one interface in the failover group
-            # so check the state of the interface
+            # we can have more than one interface in the failover
+            # group so check the state of the interface
             for i in ids:
                 iface = netif.get_interface(i)
                 for j in iface.vrrp_config:
@@ -44,20 +47,29 @@ class DetectVirtualIpStates(Service):
 
         return masters, backups
 
-    @private
     async def get_states(self, interfaces=None):
+
+        """
+        The `inits` list is not used on SCALE_ENTERPRISE but
+        is kept here to provide backwards compatibility with
+        ENTERPRISE API.
+        """
 
         masters, backups, inits = [], [], []
 
         if interfaces is None:
             interfaces = await self.middleware.call('interface.query')
 
-        internal_ints = await self.middleware.call('failover.internal_interfaces')
+        int_ifaces = await self.middleware.call('failover.internal_interfaces')
 
-        crit_ifaces = [i['id'] for i in filter_list(interfaces, [('failover_critical', '=', True)])]
+        crit_ifaces = [
+            i['id'] for i in filter_list(
+                interfaces, [('failover_critical', '=', True)]
+            )
+        ]
 
         for iface in interfaces:
-            if iface['name'] in internal_ints:
+            if iface['name'] in int_ifaces:
                 continue
             if iface['name'] not in crit_ifaces:
                 continue
@@ -67,12 +79,13 @@ class DetectVirtualIpStates(Service):
                 backups.append(iface['name'])
             else:
                 self.logger.warning(
-                    'Unknown VRRP state %r for interface %s', iface['state']['vrrp_config'][0]['state'], iface['name']
+                    'Unknown VRRP state %s for interface %s',
+                    iface['state']['vrrp_config'][0]['state'],
+                    iface['name'],
                 )
 
         return masters, backups, inits
 
-    @private
     async def check_states(self, local, remote):
 
         errors = []
@@ -83,10 +96,10 @@ class DetectVirtualIpStates(Service):
 
         for name in interfaces:
             if name not in local[0] and name in remote[0]:
-                errors.append(f'Interface {name} is MASTER on standby node')
+                errors.append('Interface "%s" is MASTER on standby node', name)
             if name in local[1] and name in remote[1]:
-                errors.append(f'Interface {name} is BACKUP on both nodes')
+                errors.append('Interface "%s" is BACKUP on both nodes', name)
             if name in local[0] and name in remote[0]:
-                errors.append(f'Interface {name} is MASTER on both nodes')
+                errors.append('Interface "%s" is MASTER on both nodes', name)
 
         return errors
