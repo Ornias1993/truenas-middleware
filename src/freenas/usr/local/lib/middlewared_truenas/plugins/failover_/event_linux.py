@@ -266,29 +266,15 @@ class FailoverService(Service):
 
         # start the MASTER failover event
         if event in ('MASTER', 'forcetakeover'):
-            vrrp_master_job = self.run_call(
+            return self.run_call(
                 'failover.events.vrrp_master', fobj, ifname, event, force_fenced, forcetakeover
-            ).wait_sync()
-
-            if vrrp_master_job.error:
-                logger.error(
-                    'An error occurred while becoming the MASTER node.'
-                    f' {vrrp_master_job.error}'
-                )
-                return self.failover_successful
+            )
 
         # start the BACKUP failover event
         elif event == 'BACKUP':
-            vrrp_backup_job = self.run_call(
+            return self.run_call(
                 'failover.events.vrrp_backup', fobj, ifname, event, force_fenced
-            ).wait_sync()
-
-            if vrrp_backup_job.error:
-                logger.error(
-                    'An error occurred while becoming the BACKUP node.'
-                    f' {vrrp_backup_job.error}'
-                )
-                return self.failover_successful
+            )
 
     @job(lock='vrrp_master')
     def vrrp_master(self, job, fobj, ifname, event, force_fenced, forcetakeover):
@@ -492,10 +478,10 @@ class FailoverService(Service):
         # restart the remaining "non-critical" services
         logger.info('Restarting remaining services')
 
-        logger.info('Restarting collected')
+        logger.info('Restarting service "collected"')
         self.run_call('service.restart', 'collectd', self.ha_propagate)
 
-        logger.info('Restarting syslog-ng')
+        logger.info('Restarting service "syslog-ng"')
         self.run_call('service.restart', 'syslogd', self.ha_propagate)
 
         for i in fobj['services']:
@@ -523,6 +509,10 @@ class FailoverService(Service):
             self.run_call('kmip.initialize_keys')
 
         logger.info('Failover event complete.')
+
+        # clear the description and set the result
+        job.set_progress(None, description='')
+        job.set_result('SUCCESS')
 
         self.failover_successful = True
 
