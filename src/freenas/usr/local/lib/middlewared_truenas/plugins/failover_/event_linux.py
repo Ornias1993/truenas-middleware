@@ -486,7 +486,7 @@ class FailoverService(Service):
 
         for i in fobj['services']:
             if i['srv_service'] not in self.critical_services and i['srv_enable']:
-                logger.info('Restarting service "%s"', i['service'])
+                logger.info('Restarting service "%s"', i['srv_service'])
                 self.run_call('service.restart', i['srv_service'], self.ha_propagate)
 
         # TODO: jails don't exist on SCALE (yet)
