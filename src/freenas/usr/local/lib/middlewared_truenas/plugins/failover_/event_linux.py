@@ -1,10 +1,11 @@
-from collections import defaultdict
+import asyncio
 import os
 import time
 import contextlib
 import shutil
 import signal
 import logging
+from collections import defaultdict
 
 from middlewared.utils import filter_list
 from middlewared.service import Service, job
@@ -32,6 +33,15 @@ logger = logging.getLogger('failover')
 # zpools.
 
 
+class AllZpoolsFailedToImport(Exception):
+
+    """
+    This is raised if all zpools failed to
+    import when becoming master.
+    """
+    pass
+
+
 class ZpoolExportTimeout(Exception):
 
     """
@@ -50,43 +60,83 @@ class IgnoreFailoverEvent(Exception):
     pass
 
 
+class FencedError(Exception):
+
+    """
+    This is raised if fenced fails to run.
+    """
+    pass
+
+
 class FailoverService(Service):
 
     class Config:
         private = True
         namespace = 'failover.events'
 
-    # boolean that represents if a failover event was successful or not
-    failover_successful = False
+    # represents if a failover event was successful or not
+    FAILOVER_RESULT = None
 
     # list of critical services that get restarted first
     # before the other services during a failover event
-    critical_services = ['iscsitarget', 'cifs', 'nfs', 'afp']
+    CRITICAL_SERVICES = ['iscsitarget', 'cifs', 'nfs', 'afp']
 
     # option to be given when changing the state of a service
     # during a failover event, we do not want to replicate
     # the state of a service to the other controller since
     # that's being handled by us explicitly
-    ha_propagate = {'ha_propagate': False}
+    HA_PROPAGATE = {'ha_propagate': False}
 
     # file created by the pool plugin during certain
     # scenarios when importing zpools on boot
-    zpool_killcache = '/data/zfs/killcache'
+    ZPOOL_KILLCACHE = '/data/zfs/killcache'
 
     # zpool cache file managed by ZFS
-    zpool_cache_file = '/data/zfs/zpool.cache'
+    ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
 
     # zpool cache file that's been saved by pool plugin
     # during certain scenarios importing zpools on boot
-    zpool_cache_file_saved = f'{zpool_cache_file}.saved'
+    ZPOOL_CACHE_FILE_saved = f'{ZPOOL_CACHE_FILE}.saved'
 
     # This file is managed in unscheduled_reboot_alert.py
     # Ticket 39114
-    watchdog_alert_file = "/data/sentinels/.watchdog-alert"
+    WATCHDOG_ALERT_FILE = '/data/sentinels/.watchdog-alert'
 
     # this is the time limit we place on exporting the
     # zpool(s) when becoming the BACKUP node
-    zpool_export_timeout = 4  # seconds
+    ZPOOL_EXPORT_TIMEOUT = 4  # seconds
+
+    async def restart_background(self, services):
+
+        """
+        Restarting non-critical services can cause unnecessary
+        delays during a failover event. Restart these services
+        in the background.
+        """
+
+        logger.info('Syncing enclosure')
+        asyncio.ensure_future(self.middleware.call(
+            'enclosure.sync_zpool'
+        ))
+
+        # these don't exist in db but still need to be restarted
+        # on failover event
+        pre_services = ['collectd', 'syslogd']
+
+        for i in pre_services:
+            logger.info('Restarting service "%s"', i)
+            asyncio.ensure_future(self.middleware.call(
+                'service.restart', i, self.HA_PROPAGATE
+            ))
+
+        for i in services:
+            # the `self.CRITICAL_SERVICES` have already been restarted by the time
+            # this method is called so don't restart them again unnecessarily
+            if i['srv_service'] not in self.CRITICAL_SERVICES and i['srv_enable']:
+                logger.info('Restarting service "%s"', i['srv_service'])
+                asyncio.ensure_future(self.middleware.call(
+                    'service.restart', i['srv_service'], self.HA_PROPAGATE
+                ))
 
     def run_call(self, method, *args, **kwargs):
         try:
@@ -175,7 +225,7 @@ class FailoverService(Service):
         current_events = self.run_call(
             'core.get_jobs', [
                 ('OR', [
-                    ('method', '=', 'failover.events.vrrp_master')
+                    ('method', '=', 'failover.events.vrrp_master'),
                     ('method', '=', 'failover.events.vrrp_backup')
                 ])
             ]
@@ -324,10 +374,6 @@ class FailoverService(Service):
                     'MASTER node. Ignoring event.', ifname, status[0],
                 )
 
-                # raising an exception in a job will cause the state to be set to
-                # FAILED. Technically the failover event has failed at this point
-                # but it's by design so set the result of the job to 'IGNORED'
-                job.set_result('IGNORED')
                 raise IgnoreFailoverEvent()
 
             logger.warning('Entering MASTER on "%s".', ifname)
@@ -352,30 +398,30 @@ class FailoverService(Service):
             else:
                 logger.error(f'Fenced exited with code "{fenced_error}" which should never happen, exiting!')
 
-            return self.failover_successful
+            raise FencedError()
 
         # remove the zpool cache files if necessary
-        if os.path.exists(self.zpool_killcache):
-            for i in (self.zpool_cache_file, self.zpool_cache_file_saved):
+        if os.path.exists(self.ZPOOL_KILLCACHE):
+            for i in (self.ZPOOL_CACHE_FILE, self.ZPOOL_CACHE_FILE_saved):
                 with contextlib.suppress(Exception):
                     os.unlink(i)
 
-        # create the self.zpool_killcache file
+        # create the self.ZPOOL_KILLCACHE file
         else:
             with contextlib.suppress(Exception):
-                with open(self.zpool_killcache, 'w') as f:
+                with open(self.ZPOOL_KILLCACHE, 'w') as f:
                     f.flush()  # be sure it goes straight to disk
                     os.fsync(f.fileno())  # be EXTRA sure it goes straight to disk
 
         # if we're here and the zpool "saved" cache file exists we need to check
         # if it's modify time is < the standard zpool cache file and if it is
         # we overwrite the zpool "saved" cache file with the standard one
-        if os.path.exists(self.zpool_cache_file_saved) and os.path.exists(self.zpool_cache_file):
-            zpool_cache_mtime = os.stat(self.zpool_cache_file).st_mtime
-            zpool_cache_saved_mtime = os.stat(self.zpool_cache_file_saved).st_mtime
+        if os.path.exists(self.ZPOOL_CACHE_FILE_saved) and os.path.exists(self.ZPOOL_CACHE_FILE):
+            zpool_cache_mtime = os.stat(self.ZPOOL_CACHE_FILE).st_mtime
+            zpool_cache_saved_mtime = os.stat(self.ZPOOL_CACHE_FILE_saved).st_mtime
             if zpool_cache_mtime > zpool_cache_saved_mtime:
                 with contextlib.suppress(Exception):
-                    shutil.copy2(self.zpool_cache_file, self.zpool_cache_file_saved)
+                    shutil.copy2(self.ZPOOL_CACHE_FILE, self.ZPOOL_CACHE_FILE_saved)
 
         # set the progress to IMPORTING
         job.set_progress(None, description='IMPORTING')
@@ -391,7 +437,7 @@ class FailoverService(Service):
                     vol['guid'],
                     {
                         'altroot': '/mnt',
-                        'cachefile': self.zpool_cache_file,
+                        'cachefile': self.ZPOOL_CACHE_FILE,
                     }
                 )
             except Exception as e:
@@ -417,12 +463,10 @@ class FailoverService(Service):
                 )
 
             logger.error('All volumes failed to import!')
-            job.set_result('ERROR')
-            return self.failover_successful
+            raise AllZpoolsFailedToImport()
 
         # if we fail to import any of the zpools then alert the user but continue the process
         elif len(failed):
-            job.set_result('ERROR')
             for i in failed:
                 logger.error(
                     'Failed to import volume with name "%s" with guid "%s" '
@@ -439,24 +483,27 @@ class FailoverService(Service):
         self.run_call('failover.status_refresh')
 
         # this enables all necessary services that have been enabled by the user
-        logger.info('Enabling necessary services.')
+        logger.info('Enabling necessary services')
         self.run_call('etc.generate', 'rc')
 
         logger.info('Configuring system dataset')
         self.run_call('etc.generate', 'system_dataset')
 
         # Write the certs to disk based on what is written in db.
+        logger.info('Configuring SSL')
         self.run_call('etc.generate', 'ssl')
+
         # Now we restart the appropriate services to ensure it's using correct certs.
+        logger.info('Configuring HTTP')
         self.run_call('service.restart', 'http')
 
         # now we restart the services, prioritizing the "critical" services
         logger.info('Restarting critical services.')
-        for i in self.critical_services:
+        for i in self.CRITICAL_SERVICES:
             for j in fobj['services']:
                 if i == j['srv_service'] and j['srv_enable']:
                     logger.info('Restarting critical service "%s"', i)
-                    self.run_call('service.restart', i, self.ha_propagate)
+                    self.run_call('service.restart', i, self.HA_PROPAGATE)
 
         # TODO: look at nftables
         # logger.info('Allowing network traffic.')
@@ -472,22 +519,11 @@ class FailoverService(Service):
         logger.info('Syncing disks')
         self.run_call('disk.sync_all')
 
-        logger.info('Syncing enclosure')
-        self.run_call('enclosure.sync_zpool')
-
         # restart the remaining "non-critical" services
         logger.info('Restarting remaining services')
 
-        logger.info('Restarting service "collected"')
-        self.run_call('service.restart', 'collectd', self.ha_propagate)
-
-        logger.info('Restarting service "syslog-ng"')
-        self.run_call('service.restart', 'syslogd', self.ha_propagate)
-
-        for i in fobj['services']:
-            if i['srv_service'] not in self.critical_services and i['srv_enable']:
-                logger.info('Restarting service "%s"', i['srv_service'])
-                self.run_call('service.restart', i['srv_service'], self.ha_propagate)
+        # restart the non-critical services in the background
+        self.run_call('failover.events.restart_background', fobj['services'])
 
         # TODO: jails don't exist on SCALE (yet)
         # TODO: vms don't exist on SCALE (yet)
@@ -511,12 +547,11 @@ class FailoverService(Service):
         logger.info('Failover event complete.')
 
         # clear the description and set the result
-        job.set_progress(None, description='')
-        job.set_result('SUCCESS')
+        job.set_progress(None, description='SUCCESS')
 
-        self.failover_successful = True
+        self.FAILOVER_RESULT = 'SUCCESS'
 
-        return self.failover_successful
+        return self.FAILOVER_RESULT
 
     @job(lock='vrrp_backup')
     def vrrp_backup(self, job, fobj, ifname, event, force_fenced):
@@ -546,7 +581,6 @@ class FailoverService(Service):
                 'Ignoring event.', ifname, status[1],
             )
 
-            job.set_result('IGNORED')
             raise IgnoreFailoverEvent()
 
         logger.warning('Entering BACKUP on "%s".', ifname)
@@ -575,19 +609,19 @@ class FailoverService(Service):
         # So if we panic here, middleware will check for this file and send an appropriate email.
         # ticket 39114
         with contextlib.suppress(Exception):
-            with open(self.watchdog_alert_file, 'w') as f:
+            with open(self.WATCHDOG_ALERT_FILE, 'w') as f:
                 f.write(int(time.time()))
                 f.flush()  # be sure it goes straight to disk
                 os.fsync(f.fileno())  # be EXTRA sure it goes straight to disk
 
-        # set a countdown = to self.zpool_export_timeout.
+        # set a countdown = to self.ZPOOL_EXPORT_TIMEOUT.
         # if we can't export the zpool(s) in this timeframe,
         # we send the 'b' character to the /proc/sysrq-trigger
         # to trigger an immediate reboot of the system
         # https://www.kernel.org/doc/html/latest/admin-guide/sysrq.html
         signal.signal(signal.SIGALRM, self._zpool_export_sig_alarm)
         try:
-            signal.alarm(self.zpool_export_timeout)
+            signal.alarm(self.ZPOOL_EXPORT_TIMEOUT)
             # export the zpool(s)
             try:
                 for vol in fobj['volumes']:
@@ -608,30 +642,30 @@ class FailoverService(Service):
 
         # We also remove this file here, because on boot we become BACKUP if the other
         # controller is MASTER. So this means we have no volumes to export which means
-        # the `self.zpool_export_timeout` is honored.
+        # the `self.ZPOOL_EXPORT_TIMEOUT` is honored.
         with contextlib.suppress(Exception):
-            os.unlink(self.watchdog_alert_file)
+            os.unlink(self.WATCHDOG_ALERT_FILE)
 
         logger.info('Refreshing failover status')
         self.run_call('failover.status_refresh')
 
         logger.info('Restarting syslog-ng')
-        self.run_call('service.restart', 'syslogd', self.ha_propagate)
+        self.run_call('service.restart', 'syslogd', self.HA_PROPAGATE)
 
         logger.info('Regenerating cron')
         self.run_call('etc.generate', 'cron')
 
         logger.info('Stopping smartd')
-        self.run_call('service.stop', 'smartd', self.ha_propagate)
+        self.run_call('service.stop', 'smartd', self.HA_PROPAGATE)
 
         logger.info('Stopping collectd')
-        self.run_call('service.stop', 'collectd', self.ha_propagate)
+        self.run_call('service.stop', 'collectd', self.HA_PROPAGATE)
 
         # we keep SSH running on both controllers (if it's enabled by user)
         for i in fobj['services']:
             if i['srv_service'] == 'ssh' and i['srv_enable']:
                 logger.info('Restarting SSH')
-                self.run_call('service.restart', 'ssh', self.ha_propagate)
+                self.run_call('service.restart', 'ssh', self.HA_PROPAGATE)
 
         # TODO: ALUA on SCALE??
         # do something with iscsi service here
@@ -640,9 +674,9 @@ class FailoverService(Service):
         self.run_call('failover.call_remote', 'failover.sync_keys_to_remote_node')
 
         logger.info('Successfully became the BACKUP node.')
-        self.failover_successful = True
+        self.FAILOVER_RESULT = 'SUCCESS'
 
-        return self.failover_successful
+        return self.FAILOVER_RESULT
 
 
 async def vrrp_fifo_hook(middleware, data):
