@@ -104,7 +104,14 @@ db_update()
 			rm ${HBA_FIRMWARE_UPDATE}
 		fi
 	fi
-			
+
+	if [ -f $NEED_UPDATE_SENTINEL ]; then
+		LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/python /usr/local/sbin/firmware_update_ses.py
+		if [ $? -eq 0 ]; then
+			REBOOT_REQUIRED=1
+		fi
+	fi
+
 	if [ ! -f $NEED_UPDATE_SENTINEL ]; then
 		if [ ${REBOOT_REQUIRED} -eq 1 ]; then
 			reboot
