@@ -1,4 +1,3 @@
-import base64
 import collections
 import copy
 import errno
@@ -13,7 +12,7 @@ from pkg_resources import parse_version
 
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str, returns
 from middlewared.service import CallError, CRUDService, filterable, job, private
-from middlewared.utils import filter_list, get
+from middlewared.utils import filter_list
 from middlewared.validators import Match
 
 from .utils import (
@@ -161,39 +160,19 @@ class ChartReleaseService(CRUDService):
                 {'port': p['node_port'], 'protocol': p['protocol']} for p in node_port_svc['spec']['ports']
             ])
 
-        storage_classes = collections.defaultdict(lambda: None)
-        for storage_class in await self.middleware.call('k8s.storage_class.query'):
-            storage_classes[storage_class['metadata']['name']] = storage_class
+        if get_resources:
+            storage_mapping = await self.middleware.call('chart.release.get_workload_storage_details')
 
-        persistent_volumes = collections.defaultdict(list)
-
-        # If the chart release was consuming any PV's, they would have to be manually removed from k8s database
-        # because of chart release reclaim policy being retain
-        for pv in await self.middleware.call(
-            'k8s.pv.query', [[
-                'spec.csi.volume_attributes.openebs\\.io/poolname', '^',
-                f'{os.path.join(k8s_config["dataset"], "releases")}/'
-            ]]
-        ):
-            dataset = pv['spec']['csi']['volume_attributes']['openebs.io/poolname']
-            rl = dataset.split('/', 4)
-            if len(rl) > 4:
-                persistent_volumes[rl[3]].append(pv)
-
-        resources = {r.value: collections.defaultdict(list) for r in Resources}
-        workload_status = collections.defaultdict(lambda: {'desired': 0, 'available': 0})
-
-        for resource in Resources:
-            for r_data in await self.middleware.call(
-                f'k8s.{resource.name.lower()}.query', resources_filters, {
-                    'extra': {'events': extra.get('resource_events', False)}
-                }
-            ):
-                release_name = r_data['metadata']['namespace'][len(CHART_NAMESPACE_PREFIX):]
-                resources[resource.value][release_name].append(r_data)
-                if resource in (Resources.DEPLOYMENT, Resources.STATEFULSET):
-                    workload_status[release_name]['desired'] += (r_data['status']['replicas'] or 0)
-                    workload_status[release_name]['available'] += (r_data['status']['ready_replicas'] or 0)
+        resources_mapping = await self.middleware.call('chart.release.get_resources_with_workload_mapping', {
+            'resource_events': extra.get('resource_events', False),
+            'resource_filters': resources_filters,
+            'resources': [
+                r.name for r in (
+                    Resources if get_resources else [Resources.POD, Resources.DEPLOYMENT, Resources.STATEFULSET]
+                )
+            ],
+        })
+        resources = resources_mapping['resources']
 
         release_secrets = await self.middleware.call('chart.release.releases_secrets', extra)
         releases = []
@@ -208,7 +187,7 @@ class ChartReleaseService(CRUDService):
             ):
                 config.update(rel_data['config'])
 
-            pods_status = workload_status[name]
+            pods_status = resources_mapping['workload_status'][name]
             pod_diff = pods_status['available'] - pods_status['desired']
             status = 'ACTIVE'
             if pod_diff == 0 and pods_status['desired'] == 0:
@@ -233,36 +212,35 @@ class ChartReleaseService(CRUDService):
                 'pod_status': pods_status,
             })
 
-            release_resources = {
-                'storage_class': storage_classes[get_storage_class_name(name)],
-                'persistent_volumes': persistent_volumes[name],
-                'host_path_volumes': await self.host_path_volumes(itertools.chain(
-                    *[resources[getattr(Resources, k).value][name] for k in ('DEPLOYMENT', 'STATEFULSET')]
-                )),
-                **{r.value: resources[r.value][name] for r in Resources},
-            }
-            release_resources = {
-                **release_resources,
-                'container_images': {
-                    i_name: {
-                        'id': image_details.get('id'),
-                        'update_available': image_details.get('update_available', False)
-                    } for i_name, image_details in map(
-                        lambda i: (i, container_images.get(i, {})),
-                        list(set(
-                            c['image']
-                            for workload_type in ('deployments', 'statefulsets')
-                            for workload in release_resources[workload_type]
-                            for c in workload['spec']['template']['spec']['containers']
-                        ))
-                    )
-                },
-                'truenas_certificates': [v['id'] for v in release_data['config'].get('ixCertificates', {}).values()],
-                'truenas_certificate_authorities': [
-                    v['id'] for v in release_data['config'].get('ixCertificateAuthorities', {}).values()
-                ],
+            container_images_normalized = {
+                i_name: {
+                    'id': image_details.get('id'),
+                    'update_available': image_details.get('update_available', False)
+                } for i_name, image_details in map(
+                    lambda i: (i, container_images.get(i, {})),
+                    list(set(
+                        c['image']
+                        for workload_type in ('deployments', 'statefulsets')
+                        for workload in resources[workload_type][name]
+                        for c in workload['spec']['template']['spec']['containers']
+                    ))
+                )
             }
             if get_resources:
+                release_resources = {
+                    'storage_class': storage_mapping['storage_classes'][get_storage_class_name(name)],
+                    'persistent_volumes': storage_mapping['persistent_volumes'][name],
+                    'host_path_volumes': await self.host_path_volumes(itertools.chain(
+                        *[resources[getattr(Resources, k).value][name] for k in ('DEPLOYMENT', 'STATEFULSET')]
+                    )),
+                    **{r.value: resources[r.value][name] for r in Resources},
+                    'container_images': container_images_normalized,
+                    'truenas_certificates': [v['id'] for v in
+                                             release_data['config'].get('ixCertificates', {}).values()],
+                    'truenas_certificate_authorities': [
+                        v['id'] for v in release_data['config'].get('ixCertificateAuthorities', {}).values()
+                    ],
+                }
                 if get_locked_paths:
                     release_resources['locked_host_paths'] = [
                         v['host_path']['path'] for v in release_resources['host_path_volumes']
@@ -313,7 +291,7 @@ class ChartReleaseService(CRUDService):
                     release_data['chart_schema'] = None
 
             release_data['container_images_update_available'] = any(
-                details['update_available'] for details in release_resources['container_images'].values()
+                details['update_available'] for details in container_images_normalized.values()
             )
             release_data['chart_metadata']['latest_chart_version'] = str(latest_version)
             release_data['portals'] = await self.middleware.call(
@@ -341,81 +319,6 @@ class ChartReleaseService(CRUDService):
         else:
             app_version = release_data['chart_metadata'].get('appVersion')
         return app_version
-
-    @private
-    def retrieve_portals_for_chart_release(self, release_data, node_ip=None):
-        questions_yaml_path = os.path.join(
-            release_data['path'], 'charts', release_data['chart_metadata']['version'], 'questions.yaml'
-        )
-        if not os.path.exists(questions_yaml_path):
-            return {}
-
-        with open(questions_yaml_path, 'r') as f:
-            portals = yaml.safe_load(f.read()).get('portals') or {}
-
-        if not portals:
-            return portals
-
-        if not node_ip:
-            node_ip = self.middleware.call_sync('kubernetes.node_ip')
-
-        def tag_func(key):
-            return self.parse_tag(release_data, key, node_ip)
-
-        cleaned_portals = {}
-        for portal_type, schema in portals.items():
-            t_portals = []
-            path = schema.get('path') or '/'
-            for protocol in filter(bool, map(tag_func, schema['protocols'])):
-                for host in filter(bool, map(tag_func, schema['host'])):
-                    for port in filter(bool, map(tag_func, schema['ports'])):
-                        t_portals.append(f'{protocol}://{host}:{port}{path}')
-
-            cleaned_portals[portal_type] = t_portals
-
-        return cleaned_portals
-
-    @private
-    def parse_tag(self, release_data, tag, node_ip):
-        tag = self.parse_k8s_resource_tag(release_data, tag)
-        if not tag:
-            return
-        if tag == '$node_ip':
-            return node_ip
-        elif tag.startswith('$variable-'):
-            return get(release_data['config'], tag[len('$variable-'):])
-
-        return tag
-
-    @private
-    def parse_k8s_resource_tag(self, release_data, tag):
-        # Format expected here is "$kubernetes-resource_RESOURCE-TYPE_RESOURCE-NAME_KEY-NAME"
-        if not tag.startswith('$kubernetes-resource'):
-            return tag
-
-        if tag.count('_') < 3:
-            return
-
-        _, resource_type, resource_name, key = tag.split('_', 3)
-        if resource_type not in ('configmap', 'secret'):
-            return
-
-        resource = self.middleware.call_sync(
-            f'k8s.{resource_type}.query', [
-                ['metadata.namespace', '=', release_data['namespace']], ['metadata.name', '=', resource_name]
-            ]
-        )
-        if not resource or 'data' not in resource[0] or not isinstance(resource[0]['data'].get(key), (int, str)):
-            # Chart creator did not create the resource or we have a malformed
-            # secret/configmap, nothing we can do on this end
-            return
-        else:
-            value = resource[0]['data'][key]
-
-        if resource_type == 'secret':
-            value = base64.b64decode(value)
-
-        return str(value)
 
     @private
     async def host_path_volumes(self, resources):
@@ -663,6 +566,7 @@ class ChartReleaseService(CRUDService):
         await self.post_remove_tasks(release_name, job)
 
         await self.middleware.call('chart.release.remove_chart_release_from_events_state', release_name)
+        await self.middleware.call('chart.release.clear_chart_release_portal_cache', release_name)
         await self.middleware.call('alert.oneshot_delete', 'ChartReleaseUpdate', release_name)
 
         job.set_progress(100, f'{release_name!r} chart release deleted')
@@ -675,6 +579,14 @@ class ChartReleaseService(CRUDService):
             args.extend([os.path.join(chart_path, 'ix_values.yaml'), '-f'])
 
         action = tn_action if tn_action == 'install' else 'upgrade'
+        if action == 'upgrade':
+            # We only keep history of max 5 upgrades
+            # We input 6 here because helm considers app setting modifications as upgrades as well
+            # which means that if an app setting is even just modified and is not an upgrade in scale terms
+            # we will essentially only be keeping 4 major upgrades revision history. With 6, we temporarily have 6
+            # secrets for the app but that gets sorted out asap after the upgrade action when we sync secrets and
+            # we end up with 5 revision secrets max per app
+            args.insert(0, '--history-max=6')
 
         with tempfile.NamedTemporaryFile(mode='w+') as f:
             f.write(yaml.dump(config))
@@ -688,6 +600,8 @@ class ChartReleaseService(CRUDService):
             stderr = cp.communicate()[1]
             if cp.returncode:
                 raise CallError(f'Failed to {tn_action} chart release: {stderr.decode()}')
+
+        self.middleware.call_sync('chart.release.clear_chart_release_portal_cache', chart_release)
 
     @accepts(Str('release_name'))
     @returns(ENTRY)
